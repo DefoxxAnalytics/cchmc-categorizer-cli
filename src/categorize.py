@@ -24,11 +24,14 @@ from datetime import datetime
 sys.stdout.reconfigure(encoding='utf-8')
 
 
+class ConfigError(Exception):
+    pass
+
+
 def load_config(config_path: str, input_override: str = None, output_dir_override: str = None) -> dict:
     config_path = Path(config_path).resolve()
     if not config_path.exists():
-        print(f"ERROR: Config file not found: {config_path}")
-        sys.exit(1)
+        raise ConfigError(f"Config file not found: {config_path}")
 
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -38,26 +41,22 @@ def load_config(config_path: str, input_override: str = None, output_dir_overrid
     required_sections = ['client', 'paths', 'columns', 'classification']
     for section in required_sections:
         if section not in config:
-            print(f"ERROR: Missing required config section: '{section}'")
-            sys.exit(1)
+            raise ConfigError(f"Missing required config section: '{section}'")
 
     required_paths = ['input', 'sc_mapping', 'taxonomy', 'keyword_rules', 'refinement_rules', 'output_dir', 'output_prefix']
     for key in required_paths:
         if key not in config['paths']:
-            print(f"ERROR: Missing required path: 'paths.{key}'")
-            sys.exit(1)
+            raise ConfigError(f"Missing required path: 'paths.{key}'")
 
     required_columns = ['spend_category', 'supplier', 'line_memo', 'line_of_service', 'cost_center', 'amount']
     for key in required_columns:
         if key not in config['columns']:
-            print(f"ERROR: Missing required column mapping: 'columns.{key}'")
-            sys.exit(1)
+            raise ConfigError(f"Missing required column mapping: 'columns.{key}'")
 
     required_class = ['sc_code_pattern', 'confidence_high', 'confidence_medium']
     for key in required_class:
         if key not in config['classification']:
-            print(f"ERROR: Missing required classification param: 'classification.{key}'")
-            sys.exit(1)
+            raise ConfigError(f"Missing required classification param: 'classification.{key}'")
 
     resolved = {}
     for key in ['input', 'sc_mapping', 'taxonomy', 'keyword_rules', 'refinement_rules']:
@@ -74,15 +73,14 @@ def load_config(config_path: str, input_override: str = None, output_dir_overrid
 
     for key in ['input', 'sc_mapping', 'taxonomy', 'keyword_rules', 'refinement_rules']:
         if not resolved[key].exists():
-            print(f"ERROR: File not found: {resolved[key]} (from paths.{key})")
-            sys.exit(1)
+            raise ConfigError(f"File not found: {resolved[key]} (from paths.{key})")
 
     return config
 
 
 def load_sc_mapping(path: Path) -> dict[str, dict]:
     with open(path, 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f)
+        data = yaml.safe_load(f) or {}
 
     mapping = {}
     for sc_code, info in data.get('mappings', {}).items():
@@ -118,42 +116,68 @@ def build_taxonomy_lookup(taxonomy_df: pd.DataFrame) -> dict[str, dict]:
 
 def load_keyword_rules(path: Path) -> list[dict]:
     with open(path, 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f)
-    return data.get('rules', [])
+        data = yaml.safe_load(f) or {}
+    rules = data.get('rules', [])
+    for i, rule in enumerate(rules):
+        for key in ('pattern', 'category'):
+            if key not in rule:
+                raise ConfigError(f"keyword_rules[{i}] missing required key '{key}'")
+        try:
+            rule['_compiled'] = re.compile(rule['pattern'], re.IGNORECASE)
+        except re.error as e:
+            raise ConfigError(f"keyword_rules[{i}] invalid regex '{rule['pattern']}': {e}")
+    return rules
+
+
+def _validate_and_compile_rules(rules, section_name, required_keys, pattern_key):
+    for i, rule in enumerate(rules):
+        for key in required_keys:
+            if key not in rule:
+                raise ConfigError(f"{section_name}[{i}] missing required key '{key}'")
+        try:
+            rule['_compiled'] = re.compile(rule[pattern_key], re.IGNORECASE)
+        except re.error as e:
+            raise ConfigError(f"{section_name}[{i}] invalid regex '{rule[pattern_key]}': {e}")
 
 
 def load_refinement_rules(path: Path) -> dict:
     with open(path, 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f)
+        data = yaml.safe_load(f) or {}
+
     supplier_rules = data.get('supplier_rules', [])
-    for rule in supplier_rules:
-        rule['_compiled'] = re.compile(rule['supplier_pattern'], re.IGNORECASE)
+    _validate_and_compile_rules(
+        supplier_rules, 'supplier_rules',
+        ('sc_codes', 'supplier_pattern', 'taxonomy_key', 'confidence'),
+        'supplier_pattern',
+    )
+
     context_rules = data.get('context_rules', [])
-    for rule in context_rules:
-        rule['_compiled'] = re.compile(rule['line_of_service_pattern'], re.IGNORECASE)
+    _validate_and_compile_rules(
+        context_rules, 'context_rules',
+        ('sc_codes', 'line_of_service_pattern', 'taxonomy_key', 'confidence'),
+        'line_of_service_pattern',
+    )
+
     cost_center_rules = data.get('cost_center_rules', [])
-    for rule in cost_center_rules:
-        rule['_compiled'] = re.compile(rule['cost_center_pattern'], re.IGNORECASE)
+    _validate_and_compile_rules(
+        cost_center_rules, 'cost_center_rules',
+        ('sc_codes', 'cost_center_pattern', 'taxonomy_key', 'confidence'),
+        'cost_center_pattern',
+    )
+
     override_rules = data.get('supplier_override_rules', [])
-    for rule in override_rules:
-        rule['_compiled'] = re.compile(rule['supplier_pattern'], re.IGNORECASE)
+    _validate_and_compile_rules(
+        override_rules, 'supplier_override_rules',
+        ('supplier_pattern', 'override_from_l1', 'taxonomy_key', 'confidence'),
+        'supplier_pattern',
+    )
+
     return {
         'supplier_rules': supplier_rules,
         'context_rules': context_rules,
         'cost_center_rules': cost_center_rules,
         'supplier_override_rules': override_rules,
     }
-
-
-def get_review_tier(confidence: float, method: str, high: float, medium: float) -> str:
-    if method in ('sc_code_mapping', 'rule') and confidence >= 0.9:
-        return 'Auto-Accept'
-    elif confidence >= high:
-        return 'Auto-Accept'
-    elif confidence >= medium:
-        return 'Quick Review'
-    else:
-        return 'Manual Review'
 
 
 def main(config: dict):
@@ -206,6 +230,25 @@ def main(config: dict):
     df = pd.read_csv(paths['input'], low_memory=False)
     total_rows = len(df)
     print(f"  Loaded {total_rows:,} rows, {len(df.columns)} columns")
+
+    if total_rows == 0:
+        raise ConfigError(f"Input CSV has 0 data rows: {paths['input']}")
+
+    required_csv_cols = {
+        'spend_category': cols['spend_category'],
+        'supplier': cols['supplier'],
+        'line_memo': cols['line_memo'],
+        'line_of_service': cols['line_of_service'],
+        'cost_center': cols['cost_center'],
+        'amount': cols['amount'],
+    }
+    missing_csv_cols = [
+        f"'{v}' (from columns.{k})"
+        for k, v in required_csv_cols.items()
+        if v not in df.columns
+    ]
+    if missing_csv_cols:
+        raise ConfigError(f"Columns not found in input CSV: {', '.join(missing_csv_cols)}")
 
     # ── Vectorized classification ───────────────────────────────────────
     print("\nClassifying transactions (vectorized)...")
@@ -406,6 +449,9 @@ def main(config: dict):
     output_columns[cols['cost_center']] = df.get(cols['cost_center'], pd.Series('', index=df.index))
     output_columns[cols['line_of_service']] = df.get(cols['line_of_service'], pd.Series('', index=df.index))
 
+    if amount_col not in output_columns:
+        output_columns[amount_col] = df[amount_col]
+
     output_columns['CategoryLevel1'] = cat_l1
     output_columns['CategoryLevel2'] = cat_l2
     output_columns['CategoryLevel3'] = cat_l3
@@ -559,5 +605,9 @@ if __name__ == "__main__":
     parser.add_argument('--output-dir', default=None, help='Override output directory from config')
     args = parser.parse_args()
 
-    config = load_config(args.config, args.input, args.output_dir)
-    main(config)
+    try:
+        config = load_config(args.config, args.input, args.output_dir)
+        main(config)
+    except ConfigError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
